@@ -11,7 +11,7 @@ subscribers from a noreply sender — on a recurring schedule.
 Runs on **GitHub Actions** in the public repo (two workflows), independent
 of this Mac being on.
 
-- **`.github/workflows/mfm-build.yml`**: Tue/Wed/Thu 4:00 PM ET -- scrape ->
+- **`.github/workflows/mfm-build.yml`**: Tue/Wed/Thu 10:00 PM ET -- scrape ->
   transcribe -> summarize -> build. Scrape exit 2 (no new episode) is a
   clean no-op. Manual run (Actions tab -> "MFM build" -> Run workflow)
   accepts an optional `date` like `Nov. 2, 2026` to build one episode.
