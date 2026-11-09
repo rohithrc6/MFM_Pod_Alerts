@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate*)",
+      "Bash(.venv/bin/python3 *)",
+      "Bash(python3 tools/*)",
+      "Bash(launchctl *)",
+      "Bash(rm -f .tmp/*)",
+      "Bash(cat .tmp/*)",
+      "Bash(ls *)",
+      "Bash(echo *)",
+      "Bash(open *)"
+    ]
+  }
+}

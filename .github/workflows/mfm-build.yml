@@ -1,0 +1,101 @@
+# Job 1 of 2: scrape -> transcribe -> summarize -> build.
+# Tue/Wed/Thu 4:00 PM America/New_York. The prepared email is committed to
+# state/ so the send job (mfm-send.yml) can pick it up the next morning.
+name: MFM build
+
+on:
+  schedule:
+    # GitHub cron is UTC-only. Both entries fire; the "ET gate" step below
+    # keeps whichever one is 4 PM in New York right now (EDT vs EST).
+    - cron: "0 20 * * 2-4"   # 4 PM EDT
+    - cron: "0 21 * * 2-4"   # 4 PM EST
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Optional: build a specific episode, e.g. "Nov. 2, 2026" (blank = newest unsent)'
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mfm-state          # never let build and send touch state/ at once
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      EMAIL_HEADER_IMAGE_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/email_assets/image.png
+    steps:
+      - name: ET gate (skip the off-season UTC trigger)
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$(TZ=America/New_York date +%z)" = "-0400" ]; then want="0 20 * * 2-4"; else want="0 21 * * 2-4"; fi
+          if [ "${{ github.event.schedule }}" = "$want" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; echo "Not 4 PM ET for this trigger; skipping."; fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -r requirements.txt
+
+      - name: Restore state
+        if: steps.gate.outputs.run == 'true'
+        run: mkdir -p .tmp && cp state/*.json state/*.html .tmp/ 2>/dev/null || true
+
+      - name: Scrape
+        id: scrape
+        if: steps.gate.outputs.run == 'true'
+        env:
+          EPISODE_DATE: ${{ inputs.date }}
+        run: |
+          set +e
+          if [ -n "$EPISODE_DATE" ]; then
+            python tools/scrape_show_notes.py --date "$EPISODE_DATE"
+          else
+            python tools/scrape_show_notes.py
+          fi
+          code=$?
+          if [ $code -eq 2 ]; then echo "new=false" >> "$GITHUB_OUTPUT"; exit 0; fi   # no new episode = normal no-op
+          echo "new=true" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Transcribe
+        if: steps.scrape.outputs.new == 'true'
+        run: python tools/transcribe_episode.py
+
+      - name: Summarize
+        if: steps.scrape.outputs.new == 'true'
+        run: python tools/summarize_episode.py
+
+      - name: Build email
+        if: steps.scrape.outputs.new == 'true'
+        run: python tools/build_email.py
+
+      - name: Save state
+        # always(): even on failure, persist scraped_episode.json so the send
+        # job's stale-build guard sees the mismatch and refuses to send.
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          for f in scraped_episode.json email_body.html last_built_episode.json; do
+            [ -f ".tmp/$f" ] && cp ".tmp/$f" state/
+          done
+          git config user.name "mfm-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state episode_summaries
+          git diff --cached --quiet || git commit -m "build: $(date -u +%F) state update"
+          git pull --rebase -q && git push -q

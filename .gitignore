@@ -1,0 +1,15 @@
+# Secrets -- never commit. On GitHub these live in repo Secrets.
+.env
+credentials.json
+token.json
+
+# Subscriber emails (repo is public). Actions reads the SUBSCRIBERS secret.
+tools/data/subscribers.csv
+
+# Local-only / regenerated
+.venv/
+.tmp/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/

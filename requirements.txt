@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+resend
+cloudinary
+python-dotenv
+openai
