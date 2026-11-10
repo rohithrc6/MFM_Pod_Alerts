@@ -1,12 +1,12 @@
 # Job 2 of 2: send the email the build job prepared.
-# Wed/Thu/Fri 7:00 AM America/New_York. send_email.py exits without sending
+# Tue-Sat 7:00 AM America/New_York (the morning after each build). send_email.py exits without sending
 # if there's no new episode, the build is stale, or the summary is empty.
 name: MFM send
 
 on:
   schedule:
-    - cron: "0 11 * * 3-5"   # 7 AM EDT
-    - cron: "0 12 * * 3-5"   # 7 AM EST
+    - cron: "0 11 * * 2-6"   # 7 AM EDT (Tue-Sat)
+    - cron: "0 12 * * 2-6"   # 7 AM EST (Tue-Sat)
   workflow_dispatch:
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
         id: gate
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ "$(TZ=America/New_York date +%z)" = "-0400" ]; then want="0 11 * * 3-5"; else want="0 12 * * 3-5"; fi
+          if [ "$(TZ=America/New_York date +%z)" = "-0400" ]; then want="0 11 * * 2-6"; else want="0 12 * * 2-6"; fi
           if [ "${{ github.event.schedule }}" = "$want" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; echo "Not 7 AM ET for this trigger; skipping."; fi
 
       - uses: actions/checkout@v4

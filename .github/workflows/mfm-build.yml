@@ -1,5 +1,5 @@
 # Job 1 of 2: scrape -> transcribe -> summarize -> build.
-# Tue/Wed/Thu 10:00 PM America/New_York. The prepared email is committed to
+# Mon-Fri 10:00 PM America/New_York. The prepared email is committed to
 # state/ so the send job (mfm-send.yml) can pick it up the next morning.
 name: MFM build
 
@@ -7,9 +7,9 @@ on:
   schedule:
     # GitHub cron is UTC-only. Both entries fire; the "ET gate" step below
     # keeps whichever one is 10 PM in New York right now (EDT vs EST).
-    # 10 PM ET is already the next day in UTC, hence weekdays 3-5 (Wed-Fri UTC).
-    - cron: "0 2 * * 3-5"    # 10 PM EDT (Tue-Thu ET)
-    - cron: "0 3 * * 3-5"    # 10 PM EST (Tue-Thu ET)
+    # 10 PM ET is already the next day in UTC, hence weekdays 2-6 (Tue-Sat UTC).
+    - cron: "0 2 * * 2-6"    # 10 PM EDT (Mon-Fri ET)
+    - cron: "0 3 * * 2-6"    # 10 PM EST (Mon-Fri ET)
   workflow_dispatch:
     inputs:
       date:
@@ -36,7 +36,7 @@ jobs:
         id: gate
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ "$(TZ=America/New_York date +%z)" = "-0400" ]; then want="0 2 * * 3-5"; else want="0 3 * * 3-5"; fi
+          if [ "$(TZ=America/New_York date +%z)" = "-0400" ]; then want="0 2 * * 2-6"; else want="0 3 * * 2-6"; fi
           if [ "${{ github.event.schedule }}" = "$want" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; echo "Not 10 PM ET for this trigger; skipping."; fi
 
       - uses: actions/checkout@v4

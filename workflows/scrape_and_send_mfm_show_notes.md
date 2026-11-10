@@ -11,11 +11,11 @@ subscribers from a noreply sender — on a recurring schedule.
 Runs on **GitHub Actions** in the public repo (two workflows), independent
 of this Mac being on.
 
-- **`.github/workflows/mfm-build.yml`**: Tue/Wed/Thu 10:00 PM ET -- scrape ->
+- **`.github/workflows/mfm-build.yml`**: Mon-Fri 10:00 PM ET -- scrape ->
   transcribe -> summarize -> build. Scrape exit 2 (no new episode) is a
   clean no-op. Manual run (Actions tab -> "MFM build" -> Run workflow)
   accepts an optional `date` like `Nov. 2, 2026` to build one episode.
-- **`.github/workflows/mfm-send.yml`**: Wed/Thu/Fri 7:00 AM ET -- `send_email.py`.
+- **`.github/workflows/mfm-send.yml`**: Tue-Sat 7:00 AM ET (the morning after each build) -- `send_email.py`.
 - **State between runs** lives in the committed `state/` dir
   (`last_sent_episode.json`, `scraped_episode.json`, `email_body.html`,
   `last_built_episode.json`). Each job copies `state/` -> `.tmp/` before
