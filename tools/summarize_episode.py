@@ -49,11 +49,9 @@ from openai import OpenAI
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DIR = os.path.join(ROOT_DIR, ".tmp")
 SCRAPED_PATH = os.path.join(TMP_DIR, "scraped_episode.json")
-TRANSCRIPT_PATH = os.path.join(TMP_DIR, "transcript.json")
 SUMMARIES_DIR = os.path.join(ROOT_DIR, "episode_summaries")
-REJECTED_PATH = os.path.join(TMP_DIR, "rejected_summary.json")
 
-from guards import TIMESTAMP_RE, summary_path_for, summary_problems
+from guards import TIMESTAMP_RE, rejected_path_for, summary_path_for, summary_problems, transcript_path_for
 
 MODEL = "gpt-4o"
 
@@ -333,34 +331,89 @@ def generate_key_takeaways(client, full_transcript_text):
     return takeaways
 
 
-def main():
-    """Orchestrate the full summarisation pipeline:
-    1. Load the newest episode from scraped_episode.json and the full
-       transcript from transcript.json.
-    2. Extract chapter boundaries from the episode's show-notes timestamps.
-    3. Generate chapter summaries (draft + judge, batched single call).
-    4. Generate key takeaways (draft + judge, full transcript).
-    5. Write results to episode_summaries/<date>.json (permanent storage).
-    """
-    if not os.path.exists(SCRAPED_PATH) or not os.path.exists(TRANSCRIPT_PATH):
+def summarize_one(client, episode, repair=False):
+    """Summarize one episode; writes episode_summaries/<slug>.json or exits 1."""
+    output_path = summary_path_for(episode)
+    rejected_path = rejected_path_for(episode)
+
+    if os.path.exists(output_path) and not repair:
+        with open(output_path) as f:
+            if not summary_problems(json.load(f), episode["show_notes"]):
+                print(f"  Valid summary already exists -> {output_path} (skipping)")
+                return
+
+    transcript_path = transcript_path_for(episode)
+    if not os.path.exists(transcript_path):
+        print(f"{transcript_path} not found. Run transcribe_episode.py first.", file=sys.stderr)
+        sys.exit(1)
+    with open(transcript_path) as f:
+        transcript = json.load(f)
+    if not transcript:
+        print(f"{transcript_path} is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    chapters = extract_chapters(episode["show_notes"])
+    if not chapters:
+        # Guardrail: scrape should already have caught this.
+        print("No timestamped chapters found in show notes; refusing to summarize.", file=sys.stderr)
+        sys.exit(1)
+
+    if repair:
+        # Reuse a previously rejected result and only fill the chapters it
+        # is missing, instead of paying for the full draft + judge again.
+        if not os.path.exists(rejected_path):
+            print(f"  --repair: no {rejected_path}; nothing to repair for this episode.")
+            return
+        with open(rejected_path) as f:
+            rejected = json.load(f)
+        print("  Repairing previously rejected summary (missing chapters only)...")
+        chapter_summaries = fill_missing_chapters(
+            client, rejected.get("chapter_summaries") or {}, build_chapter_blocks(chapters, transcript)
+        )
+        key_takeaways = rejected.get("key_takeaways") or []
+        if not key_takeaways:
+            print("  Generating key takeaways (draft + judge pass)...")
+            key_takeaways = generate_key_takeaways(client, " ".join(s["text"] for s in transcript))
+    else:
+        print(f"  Summarizing {len(chapters)} chapter(s) (draft + judge pass)...")
+        chapter_summaries = generate_chapter_summaries(client, chapters, transcript)
+        print("  Generating key takeaways (draft + judge pass)...")
+        key_takeaways = generate_key_takeaways(client, " ".join(seg["text"] for seg in transcript))
+
+    result = {"chapter_summaries": chapter_summaries, "key_takeaways": key_takeaways}
+
+    # Guardrail: only valid summaries reach the permanent episode_summaries/
+    # dir. A bad result is parked in .tmp/rejected/ and the chain stops.
+    problems = summary_problems(result, episode["show_notes"])
+    if problems:
+        os.makedirs(os.path.dirname(rejected_path), exist_ok=True)
+        with open(rejected_path, "w") as f:
+            json.dump(result, f, indent=2)
         print(
-            f"{SCRAPED_PATH} and {TRANSCRIPT_PATH} are both required. "
-            "Run scrape_show_notes.py and transcribe_episode.py first.",
+            f"Summary for {episode['title']!r} failed validation, not saved:\n  - "
+            + "\n  - ".join(problems)
+            + f"\nRaw output parked at {rejected_path} (fix with --repair)",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    os.makedirs(SUMMARIES_DIR, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  Summarized {len(chapter_summaries)} chapter(s) -> {output_path}")
+
+
+def main():
+    """Summarize every episode in scraped_episode.json (oldest first) into
+    episode_summaries/<slug>.json. Episodes with a valid summary are skipped.
+    --repair: only fill missing chapters from .tmp/rejected/<slug>.json."""
+    if not os.path.exists(SCRAPED_PATH):
+        print(f"{SCRAPED_PATH} not found. Run scrape_show_notes.py first.", file=sys.stderr)
+        sys.exit(1)
     with open(SCRAPED_PATH) as f:
         episodes = json.load(f)
     if not episodes:
         print("No new episodes to summarize.")
-        sys.exit(1)
-    episode = episodes[-1]
-
-    with open(TRANSCRIPT_PATH) as f:
-        transcript = json.load(f)
-    if not transcript:
-        print(f"{TRANSCRIPT_PATH} is empty.", file=sys.stderr)
         sys.exit(1)
 
     load_dotenv(os.path.join(ROOT_DIR, ".env"))
@@ -370,60 +423,9 @@ def main():
         sys.exit(1)
     client = OpenAI(api_key=api_key)
 
-    os.makedirs(SUMMARIES_DIR, exist_ok=True)
-    output_path = summary_path_for(episode)
-
-    chapters = extract_chapters(episode["show_notes"])
-    if not chapters:
-        # Guardrail: scrape should already have caught this. Fail loudly
-        # instead of writing an empty summary that later gets emailed.
-        print("No timestamped chapters found in show notes; refusing to summarize.", file=sys.stderr)
-        sys.exit(1)
-
-    if "--repair" in sys.argv:
-        # Reuse a previously rejected result and only fill the chapters it
-        # is missing, instead of paying for the full draft + judge again.
-        if not os.path.exists(REJECTED_PATH):
-            print(f"--repair needs {REJECTED_PATH}; nothing to repair.", file=sys.stderr)
-            sys.exit(1)
-        with open(REJECTED_PATH) as f:
-            rejected = json.load(f)
-        print("Repairing previously rejected summary (missing chapters only)...")
-        chapter_summaries = fill_missing_chapters(
-            client, rejected.get("chapter_summaries") or {}, build_chapter_blocks(chapters, transcript)
-        )
-        key_takeaways = rejected.get("key_takeaways") or []
-        if not key_takeaways:
-            print("Generating key takeaways (draft + judge pass)...")
-            key_takeaways = generate_key_takeaways(client, " ".join(s["text"] for s in transcript))
-    else:
-        print(f"Summarizing {len(chapters)} chapter(s) (draft + judge pass)...")
-        chapter_summaries = generate_chapter_summaries(client, chapters, transcript)
-
-        full_text = " ".join(seg["text"] for seg in transcript)
-        print("Generating key takeaways (draft + judge pass)...")
-        key_takeaways = generate_key_takeaways(client, full_text)
-
-    result = {"chapter_summaries": chapter_summaries, "key_takeaways": key_takeaways}
-
-    # Guardrail: only valid summaries reach the permanent episode_summaries/
-    # dir. A bad result is parked in .tmp for inspection and the chain stops.
-    problems = summary_problems(result, episode["show_notes"])
-    if problems:
-        with open(REJECTED_PATH, "w") as f:
-            json.dump(result, f, indent=2)
-        print(
-            "Summary failed validation, not saved to episode_summaries/:\n  - "
-            + "\n  - ".join(problems)
-            + f"\nRaw output parked at {REJECTED_PATH}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    with open(output_path, "w") as f:
-        json.dump(result, f, indent=2)
-
-    print(f"Summarized {len(chapter_summaries)} chapter(s) -> {output_path}")
+    for n, episode in enumerate(episodes, 1):
+        print(f"[{n}/{len(episodes)}] {episode['title']}")
+        summarize_one(client, episode, repair="--repair" in sys.argv)
 
 
 if __name__ == "__main__":

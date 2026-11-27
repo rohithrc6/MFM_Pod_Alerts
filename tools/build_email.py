@@ -1,14 +1,13 @@
-"""Render the scraped episode(s) into a styled HTML email body.
+"""Render each scraped episode into its own styled HTML email.
 
 Usage:
     python3 tools/build_email.py
 
 Reads .tmp/scraped_episode.json (written by scrape_show_notes.py),
-episode_summaries/<date>.json (written by summarize_episode.py, one
-file per episode, named after its published date), and
-EMAIL_HEADER_IMAGE_URL from .env, writes .tmp/email_body.html. If
-scraped_episode.json is an empty list, writes nothing and exits 1 so the
-caller knows to skip sending.
+episode_summaries/<slug>.json (written by summarize_episode.py, one file
+per episode), and EMAIL_HEADER_IMAGE_URL; writes one email per episode to
+.tmp/emails/<slug>.html. If scraped_episode.json is an empty list, writes
+nothing and exits 1 so the caller knows to skip sending.
 
 Theme mirrors My First Million's own branding: black + signature yellow
 (#f5d90a, the color of mfmpod.com's own subscribe button) on a cream
@@ -32,8 +31,9 @@ background, bold uppercase headers. Links render as small favicon icons
 4. wrap_shell() wraps the assembled content in a full email-safe HTML document
    (table-based layout, inline CSS) with the black header band containing the
    Oswald-font tagline and centred header image, and the black footer band.
-5. On success, writes .tmp/last_built_episode.json so send_email.py can verify
-   the email was freshly built for the current scraped episode.
+5. On success, writes .tmp/last_built_episode.json (a list of {url, title,
+   key}, one per email) so send_email.py can verify each email was freshly
+   built for the episode it's sending.
 """
 import html
 import json
@@ -49,11 +49,10 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DIR = os.path.join(ROOT_DIR, ".tmp")
 INPUT_PATH = os.path.join(TMP_DIR, "scraped_episode.json")
 SUMMARIES_DIR = os.path.join(ROOT_DIR, "episode_summaries")
-OUTPUT_PATH = os.path.join(TMP_DIR, "email_body.html")
 BUILT_MARKER_PATH = os.path.join(TMP_DIR, "last_built_episode.json")
 
 
-from guards import TIMESTAMP_RE, summary_path_for, summary_problems  # noqa: E402
+from guards import TIMESTAMP_RE, email_path_for, summary_path_for, summary_problems  # noqa: E402
 
 
 def header_image_problem(url):
@@ -354,7 +353,7 @@ def render_episode_section(episode, heading_tag="h1", summary_data=None):
                                       "h1" for single-episode emails, "h2" for
                                       multi-episode catch-up emails.
             summary_data (dict)     -- contents of the episode's
-                                      episode_summaries/<date>.json file; expected
+                                      episode_summaries/<slug>.json file; expected
                                       keys: "chapter_summaries" (dict), "key_takeaways"
                                       (list). Pass None if summary data is unavailable
                                       for this episode (older episodes in a catch-up).
@@ -426,21 +425,19 @@ You're receiving this because you subscribed to <span style="color:{YELLOW};font
 
 
 def main():
-    """Orchestrate the full email-build cycle:
-    1. Load episode(s) from scraped_episode.json and summaries from the
-       per-episode file in episode_summaries/.
-    2. Render HTML for each episode section, then wrap in the document shell.
-    3. Write .tmp/email_body.html (the file send_email.py will send).
-    4. Write .tmp/last_built_episode.json so send_email.py can verify the
-       body was built for the current scraped episode before sending.
+    """Build ONE email per scraped episode (oldest first):
+    .tmp/emails/<slug>.html, plus .tmp/last_built_episode.json -- a list of
+    {url, title, key}, one per email -- so send_email.py can verify each
+    email was built for the episode it's about to send.
+
+    Guardrails: every episode must have a valid summary, and the header
+    image must load, or nothing is built (exit 1).
     """
     if not os.path.exists(INPUT_PATH):
         print(f"{INPUT_PATH} not found. Run scrape_show_notes.py first.", file=sys.stderr)
         sys.exit(1)
-
     with open(INPUT_PATH) as f:
         episodes = json.load(f)
-
     if not episodes:
         print("No new episodes to build an email for. Skipping.")
         sys.exit(1)
@@ -448,65 +445,39 @@ def main():
     load_dotenv(os.path.join(ROOT_DIR, ".env"))
     header_image_url = os.environ.get("EMAIL_HEADER_IMAGE_URL")
     if not header_image_url:
-        print(
-            "EMAIL_HEADER_IMAGE_URL is not set in .env. "
-            "Run tools/upload_header_image.py once and add the printed URL.",
-            file=sys.stderr,
-        )
+        print("EMAIL_HEADER_IMAGE_URL is not set (.env locally; derived from the repo on GitHub).", file=sys.stderr)
         sys.exit(1)
 
-    newest_episode = episodes[-1]
-    summary_path = summary_path_for(newest_episode)
-    if not os.path.exists(summary_path):
-        print(
-            f"{summary_path} not found. Run transcribe_episode.py and "
-            "summarize_episode.py first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    with open(summary_path) as f:
-        summary_data = json.load(f)
-
-    # Guardrails: never build (and so never send) an email with empty
-    # summaries/takeaways or a broken header image.
-    problems = summary_problems(summary_data, newest_episode["show_notes"])
+    problems = []
     image_problem = header_image_problem(header_image_url)
     if image_problem:
         problems.append(image_problem)
+    summaries = {}
+    for ep in episodes:
+        path = summary_path_for(ep)
+        if not os.path.exists(path):
+            problems.append(f"{ep['title']!r}: {path} not found (run transcribe + summarize)")
+            continue
+        with open(path) as f:
+            summaries[ep["url"]] = json.load(f)
+        problems += [f"{ep['title']!r}: {p}" for p in summary_problems(summaries[ep["url"]], ep["show_notes"])]
     if problems:
-        print("Not building email:\n  - " + "\n  - ".join(problems), file=sys.stderr)
+        print("Not building emails:\n  - " + "\n  - ".join(problems), file=sys.stderr)
         sys.exit(1)
 
-    # Most runs will have exactly one new episode; if multiple (e.g. a missed
-    # run), build one email covering all of them as separate sections.
-    # summary_data only ever covers the newest episode (transcribe/summarize
-    # only process episodes[-1]), so only that section gets it.
-    if len(episodes) == 1:
-        body_html = render_episode_section(episodes[0], summary_data=summary_data)
-    else:
-        sections = "".join(
-            render_episode_section(
-                ep,
-                heading_tag="h2",
-                summary_data=summary_data if ep is episodes[-1] else None,
-            )
-            + f'<hr style="border:none;border-top:2px solid {YELLOW};margin:28px 0;">'
-            for ep in episodes
-        )
-        body_html = sections
+    built = []
+    for ep in episodes:
+        out_path = email_path_for(ep)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        body_html = render_episode_section(ep, summary_data=summaries[ep["url"]])
+        with open(out_path, "w") as f:
+            f.write(wrap_shell(body_html, header_image_url))
+        built.append({"url": ep["url"], "title": ep["title"], "key": ep.get("key")})
+        print(f"Built email -> {out_path}")
 
-    final_html = wrap_shell(body_html, header_image_url)
-
-    with open(OUTPUT_PATH, "w") as f:
-        f.write(final_html)
-
-    # Record which episode this build covers so send_email.py can verify
-    # email_body.html is fresh before sending (guards against sending stale
-    # content if Job 1 was partially interrupted between scrape and build).
     with open(BUILT_MARKER_PATH, "w") as f:
-        json.dump({"url": newest_episode["url"], "title": newest_episode["title"]}, f)
-
-    print(f"Built email body -> {OUTPUT_PATH}")
+        json.dump(built, f, indent=2)
+    print(f"Built {len(built)} email(s).")
 
 
 if __name__ == "__main__":

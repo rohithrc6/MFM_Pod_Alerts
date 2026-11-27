@@ -1,6 +1,7 @@
-# Job 2 of 2: send the email the build job prepared.
-# Tue-Sat 6:47 AM America/New_York (the morning after each build). send_email.py exits without sending
-# if there's no new episode, the build is stale, or the summary is empty.
+# Job 2 of 2: send the emails the build job prepared -- one per new episode,
+# oldest first. Tue-Sat 6:47 AM America/New_York (the morning after each build).
+# send_email.py skips episodes already sent and refuses any episode whose
+# build is stale, whose title doesn't match, or whose summary is empty.
 name: MFM send
 
 on:
@@ -47,18 +48,21 @@ jobs:
 
       - name: Restore state
         if: steps.gate.outputs.run == 'true'
-        run: mkdir -p .tmp && cp state/*.json state/*.html .tmp/ 2>/dev/null || true
+        run: mkdir -p .tmp && cp -R state/. .tmp/
 
       - name: Send
         if: steps.gate.outputs.run == 'true'
         run: python tools/send_email.py
 
       - name: Save state
-        if: success() && steps.gate.outputs.run == 'true'
+        # always(): with several episodes, the first may be sent before a later
+        # one fails -- its last_sent update must still be saved, or it would be
+        # sent again on retry.
+        if: always() && steps.gate.outputs.run == 'true'
         run: |
           cp .tmp/last_sent_episode.json state/ 2>/dev/null || true
           git config user.name "mfm-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state
-          git diff --cached --quiet || git commit -m "send: $(date -u +%F) mark episode sent"
+          git diff --cached --quiet || git commit -m "send: $(date -u +%F) mark episode(s) sent"
           git pull --rebase -q && git push -q

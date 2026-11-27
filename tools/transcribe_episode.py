@@ -15,9 +15,9 @@ Whisper's API rejects uploads larger than 25 MB, but a typical MFM episode
 4. Stitch the chunks together by adding a time offset of
    (chunk_index × CHUNK_SECONDS) to every segment's start/end so that all
    timestamps reference the full episode timeline.
-5. Write the flat ordered list of segments to .tmp/transcript.json.
+5. Write the flat ordered list of segments to .tmp/transcripts/<slug>.json.
 
-Output: .tmp/transcript.json -- list of {"start": float, "end": float,
+Output: .tmp/transcripts/<slug>.json (one per scraped episode) -- list of {"start": float, "end": float,
         "text": str} covering the entire episode in chronological order.
 
 Cost: Whisper API is $0.006/minute (~$0.35-0.50 for a typical 60-90 min
@@ -32,12 +32,11 @@ import tempfile
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from guards import check_transcript
+from guards import check_transcript, summary_path_for, summary_problems, transcript_path_for
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DIR = os.path.join(ROOT_DIR, ".tmp")
 SCRAPED_PATH = os.path.join(TMP_DIR, "scraped_episode.json")
-OUTPUT_PATH = os.path.join(TMP_DIR, "transcript.json")
 
 # Re-encoded chunk settings: mono/64kbps/16kHz is plenty for speech and keeps
 # a 25-minute chunk around ~12MB, safely under Whisper's 25MB upload limit
@@ -119,29 +118,57 @@ def transcribe_chunk(client, chunk_path):
     return result.segments or []
 
 
+def transcribe_episode(client, episode):
+    """Download, chunk and transcribe one episode; returns its segments."""
+    with tempfile.TemporaryDirectory(dir=TMP_DIR) as work_dir:
+        audio_path = os.path.join(work_dir, "episode.mp3")
+        print("  Downloading episode audio...")
+        download_audio(episode["audio_url"], audio_path)
+
+        print("  Splitting into chunks...")
+        chunk_paths = split_audio(audio_path, work_dir)
+
+        all_segments = []
+        chunk_segment_counts = []
+        for i, chunk_path in enumerate(chunk_paths):
+            offset = i * CHUNK_SECONDS
+            print(f"  Transcribing chunk {i + 1}/{len(chunk_paths)}...")
+            segments = transcribe_chunk(client, chunk_path)
+            chunk_segment_counts.append(len(segments))
+            for seg in segments:
+                all_segments.append(
+                    {"start": seg.start + offset, "end": seg.end + offset, "text": seg.text.strip()}
+                )
+
+    # Guardrail: don't hand a gappy/truncated transcript to the paid
+    # summarize step -- it would produce summaries for missing chapters.
+    problems = check_transcript(all_segments, chunk_segment_counts, episode.get("show_notes", []))
+    if problems:
+        print(f"Transcript for {episode['title']!r} failed validation:\n  - " + "\n  - ".join(problems), file=sys.stderr)
+        sys.exit(1)
+    return all_segments
+
+
+def already_summarized(episode):
+    """A valid saved summary means transcribe+summarize already ran for this
+    episode (e.g. a repeat build before the send) -- skip it, don't pay twice."""
+    path = summary_path_for(episode)
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        return not summary_problems(json.load(f), episode.get("show_notes"))
+
+
 def main():
-    """Orchestrate the full transcription pipeline:
-    1. Read the newest episode's audio_url from scraped_episode.json.
-    2. Download the audio to a temp directory.
-    3. Split into CHUNK_SECONDS-second chunks via ffmpeg.
-    4. Transcribe each chunk with Whisper, then apply the time offset to
-       stitch all segments into a single episode-wide timeline.
-    5. Write the result to .tmp/transcript.json and clean up temp files.
-    """
+    """Transcribe every episode in scraped_episode.json (oldest first) to
+    .tmp/transcripts/<slug>.json. Stops at the first failure (exit 1)."""
     if not os.path.exists(SCRAPED_PATH):
         print(f"{SCRAPED_PATH} not found. Run scrape_show_notes.py first.", file=sys.stderr)
         sys.exit(1)
-
     with open(SCRAPED_PATH) as f:
         episodes = json.load(f)
     if not episodes:
         print("No new episodes to transcribe.")
-        sys.exit(1)
-
-    episode = episodes[-1]
-    audio_url = episode.get("audio_url")
-    if not audio_url:
-        print(f"No audio_url found for episode {episode['url']}", file=sys.stderr)
         sys.exit(1)
 
     load_dotenv(os.path.join(ROOT_DIR, ".env"))
@@ -149,48 +176,27 @@ def main():
     if not api_key:
         print("OPENAI_API_KEY is not set in .env.", file=sys.stderr)
         sys.exit(1)
-    # max_retries=5: SDK automatically retries APIConnectionError and
-    # RateLimitError with exponential backoff. Default is 2; bumped to 5
-    # to handle transient SSL/network hiccups during large chunk uploads.
-    # timeout=300: each chunk upload can take time on a slow connection;
-    # 5 minutes is generous but prevents silent hangs.
+    # max_retries=5 / timeout=300: large chunk uploads hit transient SSL/network
+    # errors; the SDK retries those with backoff, and 5 min stops silent hangs.
     client = OpenAI(api_key=api_key, max_retries=5, timeout=300)
 
-    with tempfile.TemporaryDirectory(dir=TMP_DIR) as work_dir:
-        audio_path = os.path.join(work_dir, "episode.mp3")
-        print("Downloading episode audio...")
-        download_audio(audio_url, audio_path)
-
-        print("Splitting into chunks...")
-        chunk_paths = split_audio(audio_path, work_dir)
-
-        all_segments = []
-        chunk_segment_counts = []
-        for i, chunk_path in enumerate(chunk_paths):
-            offset = i * CHUNK_SECONDS
-            print(f"Transcribing chunk {i + 1}/{len(chunk_paths)}...")
-            segments = transcribe_chunk(client, chunk_path)
-            chunk_segment_counts.append(len(segments))
-            for seg in segments:
-                all_segments.append(
-                    {
-                        "start": seg.start + offset,
-                        "end": seg.end + offset,
-                        "text": seg.text.strip(),
-                    }
-                )
-
-    # Guardrail: don't hand a gappy/truncated transcript to the paid
-    # summarize step -- it would produce summaries for missing chapters.
-    problems = check_transcript(all_segments, chunk_segment_counts, episode.get("show_notes", []))
-    if problems:
-        print("Transcript failed validation:\n  - " + "\n  - ".join(problems), file=sys.stderr)
-        sys.exit(1)
-
-    with open(OUTPUT_PATH, "w") as f:
-        json.dump(all_segments, f, indent=2)
-
-    print(f"Transcribed {len(all_segments)} segment(s) -> {OUTPUT_PATH}")
+    for n, episode in enumerate(episodes, 1):
+        print(f"[{n}/{len(episodes)}] {episode['title']}")
+        out_path = transcript_path_for(episode)
+        if already_summarized(episode):
+            print("  Already has a valid summary -- skipping transcription.")
+            continue
+        if os.path.exists(out_path):
+            print(f"  Transcript already exists -> {out_path}")
+            continue
+        if not episode.get("audio_url"):
+            print(f"No audio_url found for episode {episode['url']}", file=sys.stderr)
+            sys.exit(1)
+        segments = transcribe_episode(client, episode)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(segments, f, indent=2)
+        print(f"  Transcribed {len(segments)} segment(s) -> {out_path}")
 
 
 if __name__ == "__main__":

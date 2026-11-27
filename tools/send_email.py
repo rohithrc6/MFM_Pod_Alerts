@@ -1,24 +1,27 @@
-"""Send the built email body to all subscribers via Resend.
+"""Send each built episode email to all subscribers via Resend.
 
 Usage:
-    python3 tools/send_email.py
+    python3 tools/send_email.py            # send episodes not yet sent, oldest first
+    python3 tools/send_email.py --resend   # send every episode in this cycle again
 
---- STALE-EMAIL GUARD STRATEGY ---
-A critical safety check runs before any email is sent: send_email.py
-compares the episode URL stored in .tmp/last_built_episode.json (written
-by build_email.py on every successful build) against the episode URL in
-.tmp/scraped_episode.json (the current scrape cycle). If they don't match,
-it means build_email.py was NOT run after the latest scrape -- for example
-if the scrape job completed but the transcribe/summarise/build chain was
-interrupted. In that case the script exits with a clear error rather than
-silently sending stale content from a previous episode under the new
-episode's subject line. This prevents the mis-matched subject/body bug
-where subscribers receive the correct episode title but the wrong content.
+--- WHAT GETS SENT ---
+.tmp/scraped_episode.json lists this cycle's new episodes (oldest first);
+build_email.py wrote one email per episode to .tmp/emails/<slug>.html. Each
+episode is a separate email with its own subject. Episodes up to and
+including .tmp/last_sent_episode.json are skipped, so a retry after a
+partial failure never re-sends an episode that already went out.
 
-Sends one email per subscriber (so addresses aren't exposed to each other)
-from RESEND_FROM_EMAIL. Only updates .tmp/last_sent_episode.json if every
-subscriber send succeeds, so a partial failure can be safely retried
-without double-sending to anyone who already received it.
+--- GUARDRAILS (per episode, before sending it) ---
+- its email file exists and last_built_episode.json lists this exact
+  episode (url + title) -- i.e. the email wasn't left over from an older build
+- the email body contains the episode title (subject and body match)
+- its episode_summaries/<slug>.json has non-empty chapter_summaries and
+  key_takeaways
+Any failure stops the run (exit 1) before that episode is sent.
+
+Sends one email per subscriber (addresses aren't exposed to each other) from
+RESEND_FROM_EMAIL. last_sent_episode.json advances only after an episode
+reaches every subscriber; a partial failure stops there so it can be retried.
 """
 import csv
 import html
@@ -29,11 +32,10 @@ import sys
 import resend
 from dotenv import load_dotenv
 
-from guards import summary_path_for, summary_problems
+from guards import email_path_for, same_episode, summary_path_for, summary_problems
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_DIR = os.path.join(ROOT_DIR, ".tmp")
-EMAIL_BODY_PATH = os.path.join(TMP_DIR, "email_body.html")
 SCRAPED_PATH = os.path.join(TMP_DIR, "scraped_episode.json")
 BUILT_MARKER_PATH = os.path.join(TMP_DIR, "last_built_episode.json")
 SUBSCRIBERS_PATH = os.path.join(ROOT_DIR, "tools", "data", "subscribers.csv")
@@ -61,135 +63,101 @@ def mask(email):
     return f"{local[:1]}***@{domain}"
 
 
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path) as f:
+        return json.load(f)
+
+
+def episode_problems(episode, built):
+    """Everything that must hold before this episode's email may be sent."""
+    problems = []
+    if not any(b.get("url") == episode["url"] and b.get("title") == episode["title"] for b in built):
+        problems.append("last_built_episode.json has no matching entry -- email is from an older build")
+    email_path = email_path_for(episode)
+    if not os.path.exists(email_path):
+        problems.append(f"{email_path} not found -- run build_email.py")
+    elif html.escape(episode["title"]) not in open(email_path).read():
+        problems.append(f"{email_path} does not contain the title {episode['title']!r}")
+    summary = load_json(summary_path_for(episode), None)
+    problems += summary_problems(summary) if summary else [f"{summary_path_for(episode)} not found"]
+    return problems
+
+
+def send_to_all(subscribers, from_email, subject, html_body):
+    failures = []
+    for email in subscribers:
+        try:
+            resend.Emails.send({"from": from_email, "to": [email], "subject": subject, "html": html_body})
+            print(f"  Sent to {mask(email)}")
+        except Exception as exc:
+            print(f"  Failed to send to {mask(email)}: {exc}", file=sys.stderr)
+            failures.append(email)
+    return failures
+
+
 def main():
-    """Orchestrate the full send cycle:
-    1. Validate Resend credentials from .env.
-    2. Confirm email_body.html exists and was built for the current scraped
-       episode (stale-email guard via last_built_episode.json).
-    3. Load the HTML body and derive the email subject from the episode title.
-    4. Send one individual email per subscriber (no BCC -- addresses stay
-       private from each other).
-    5. On full success, write last_sent_episode.json so the next scrape cycle
-       knows not to re-process this episode.
-       On any failure, exit 1 WITHOUT writing last_sent_episode.json so the
-       whole cycle can be safely retried.
-    """
     load_dotenv(os.path.join(ROOT_DIR, ".env"))
     api_key = os.environ.get("RESEND_API_KEY")
     from_email = os.environ.get("RESEND_FROM_EMAIL")
     if not api_key or not from_email:
-        print(
-            "RESEND_API_KEY and/or RESEND_FROM_EMAIL are not set in .env.",
-            file=sys.stderr,
-        )
+        print("RESEND_API_KEY and/or RESEND_FROM_EMAIL are not set.", file=sys.stderr)
         sys.exit(1)
     resend.api_key = api_key
 
-    if not os.path.exists(EMAIL_BODY_PATH):
-        print(f"{EMAIL_BODY_PATH} not found. Run build_email.py first.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(EMAIL_BODY_PATH) as f:
-        html_body = f.read()
-
-    with open(SCRAPED_PATH) as f:
-        episodes = json.load(f)
+    episodes = load_json(SCRAPED_PATH, [])
     if not episodes:
         print("No new episode this cycle. Skipping send.")
         sys.exit(0)
-    newest_episode = episodes[-1]
 
-    # Guard against stale email_body.html: confirm build_email.py was run
-    # for this exact episode after scraping it, not a previous episode's build.
-    if not os.path.exists(BUILT_MARKER_PATH):
-        print(
-            "No last_built_episode.json found -- build_email.py hasn't run yet "
-            "for this cycle. Run build_email.py first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    with open(BUILT_MARKER_PATH) as f:
-        built = json.load(f)
-    if built.get("url") != newest_episode["url"]:
-        print(
-            f"email_body.html was built for a different episode than what was "
-            f"just scraped.\n"
-            f"  Built for: {built.get('url')}\n"
-            f"  Scraped:   {newest_episode['url']}\n"
-            "Run build_email.py again before sending.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    # Guardrail: don't send the same episode twice (e.g. a build run failed
-    # before resetting scraped_episode.json). --resend overrides on purpose.
-    if os.path.exists(LAST_SENT_PATH) and "--resend" not in sys.argv:
-        with open(LAST_SENT_PATH) as f:
-            if json.load(f).get("url") == newest_episode["url"]:
-                print(f"'{newest_episode['title']}' was already sent. Skipping (use --resend to force).")
-                sys.exit(0)
+    built = load_json(BUILT_MARKER_PATH, [])
+    if isinstance(built, dict):  # pre-Nov-2026 single-episode marker
+        built = [built]
 
-    # Guardrail (last line of defence): never send unless the episode's
-    # summary file has both non-empty chapter_summaries and key_takeaways.
-    summary_path = summary_path_for(newest_episode)
-    summary_data = None
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            summary_data = json.load(f)
-    problems = summary_problems(summary_data) if summary_data else [f"{summary_path} not found"]
-    if problems:
-        print("Not sending:\n  - " + "\n  - ".join(problems), file=sys.stderr)
-        sys.exit(1)
-
-    # Guardrail: the label (last_built_episode.json) and the email itself
-    # (email_body.html) must both carry the scraped episode's title, so the
-    # subject line and the body can never describe different episodes.
-    title = newest_episode["title"]
-    title_problems = []
-    if built.get("title") != title:
-        title_problems.append(
-            f"last_built_episode.json title {built.get('title')!r} != scraped title {title!r}"
-        )
-    if html.escape(title) not in html_body:
-        title_problems.append(f"email_body.html does not contain the title {title!r}")
-    if title_problems:
-        print("Not sending:\n  - " + "\n  - ".join(title_problems), file=sys.stderr)
-        sys.exit(1)
-
-    subject = f"MFM Show Notes: {title}"
+    # Skip everything up to and including the last episode sent (the list is
+    # oldest-first), unless --resend.
+    pending = episodes
+    last_sent = load_json(LAST_SENT_PATH, None)
+    if last_sent and "--resend" not in sys.argv:
+        for i, ep in enumerate(episodes):
+            if same_episode(ep, last_sent):
+                pending = episodes[i + 1:]
+                break
+    if not pending:
+        print("All episodes in this cycle were already sent. Skipping (use --resend to force).")
+        sys.exit(0)
 
     subscribers = load_subscribers()
     if not subscribers:
         print("No subscribers (SUBSCRIBERS env var / tools/data/subscribers.csv). Nothing to send.")
         sys.exit(1)
 
-    failures = []
-    for email in subscribers:
-        try:
-            resend.Emails.send(
-                {
-                    "from": from_email,
-                    "to": [email],
-                    "subject": subject,
-                    "html": html_body,
-                }
+    for n, episode in enumerate(pending, 1):
+        print(f"[{n}/{len(pending)}] {episode['title']}")
+        problems = episode_problems(episode, built)
+        if problems:
+            print("Not sending this or any later episode:\n  - " + "\n  - ".join(problems), file=sys.stderr)
+            sys.exit(1)
+
+        with open(email_path_for(episode)) as f:
+            html_body = f.read()
+        failures = send_to_all(subscribers, from_email, f"MFM Show Notes: {episode['title']}", html_body)
+        if failures:
+            print(
+                f"{len(failures)} of {len(subscribers)} sends failed: {[mask(e) for e in failures]}. "
+                "Not marking this episode as sent -- retry to deliver to everyone.",
+                file=sys.stderr,
             )
-            print(f"Sent to {mask(email)}")
-        except Exception as exc:
-            print(f"Failed to send to {mask(email)}: {exc}", file=sys.stderr)
-            failures.append(email)
+            sys.exit(1)
 
-    if failures:
-        print(
-            f"{len(failures)} of {len(subscribers)} sends failed: {[mask(e) for e in failures]}. "
-            "Not marking episode as sent -- retry to deliver to everyone.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        # Advance after each fully-delivered episode, so a later failure
+        # never causes this one to be re-sent.
+        with open(LAST_SENT_PATH, "w") as f:
+            json.dump({"url": episode["url"], "title": episode["title"]}, f)
+        print(f"  All {len(subscribers)} subscriber(s) sent.")
 
-    with open(LAST_SENT_PATH, "w") as f:
-        json.dump({"url": newest_episode["url"], "title": newest_episode["title"]}, f)
-
-    print(f"All {len(subscribers)} subscriber(s) sent successfully.")
+    print(f"Sent {len(pending)} episode email(s).")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 # Workflow: Scrape MFM Show Notes & Email Subscribers
 
 ## Objective
-Scrape new episode "Show Notes" from https://www.mfmpod.com/episodes/,
+Scrape new episode "Show Notes" from https://mfmpod.com/podcast,
 transcribe the real episode audio to ground per-timestamp summaries and a
-Key Takeaways section in what was actually said, render all of it into a
-styled HTML email with the MFM header image, and send that email to all
-subscribers from a noreply sender — on a recurring schedule.
+Key Takeaways section in what was actually said, render each episode into
+its own styled HTML email with the MFM header image, and send them to all
+subscribers from a noreply sender — on a recurring schedule. When several
+episodes come out between runs, each gets its own email, oldest first.
 
 ## Schedule
 Runs on **GitHub Actions** in the public repo (two workflows), independent
@@ -13,14 +14,22 @@ of this Mac being on.
 
 - **`.github/workflows/mfm-build.yml`**: Mon-Fri 10:17 PM ET -- scrape ->
   transcribe -> summarize -> build. Scrape exit 2 (no new episode) is a
-  clean no-op. Manual run (Actions tab -> "MFM build" -> Run workflow)
-  accepts an optional `date` like `Nov. 2, 2026` to build one episode.
+  clean no-op. Processes EVERY episode published since the last send.
+  Manual run (Actions tab -> "MFM build" -> Run workflow) accepts an
+  optional `title` (any unique part of an episode title, e.g. `dying rich`)
+  to build one specific episode.
 - **`.github/workflows/mfm-send.yml`**: Tue-Sat 6:47 AM ET (the morning after each build) -- `send_email.py`.
-- **State between runs** lives in the committed `state/` dir
-  (`last_sent_episode.json`, `scraped_episode.json`, `email_body.html`,
-  `last_built_episode.json`). Each job copies `state/` -> `.tmp/` before
-  running and commits it back after, along with `episode_summaries/`. The
-  two workflows share a concurrency group so they never touch state at once.
+- **State between runs** lives in the committed `state/` dir:
+  `last_sent_episode.json` ({title, url} of the newest episode sent -- the
+  scraper's "what's new" reference), `scraped_episode.json` (this cycle's
+  episodes, oldest first), `emails/<slug>.html` (one email per episode) and
+  `last_built_episode.json` (list of {url, title, key}, one per email).
+  Build restores only `last_sent_episode.json`, then REPLACES the other
+  hand-off files (even on failure, so stale emails never linger); send
+  restores all of `state/` and saves `last_sent_episode.json` back (even on
+  failure, since earlier episodes in the run may already have gone out).
+  Build also commits `episode_summaries/`. The two workflows share a
+  concurrency group so they never touch state at once.
   Local runs still use `.tmp/` and do NOT update `state/` -- the repo is
   the source of truth for the schedule.
 - **Timezone**: GitHub cron is UTC-only, so each workflow lists both the EDT
@@ -72,19 +81,26 @@ lives in an iCloud-synced ~/Documents.
 
 ## Recurring run sequence
 1. `python3 tools/scrape_show_notes.py`
-   - Compares the episodes index against `.tmp/last_sent_episode.json` to
-     find episodes newer than the last one successfully sent.
-   - Writes `.tmp/scraped_episode.json` (a list; empty list = nothing new;
-     each episode includes its `audio_url`, pulled from the page's
-     `og:audio` meta tag).
+   - Walks the listing (https://mfmpod.com/podcast, then /podcast/p/2 ... up
+     to 5 pages) newest-first; every episode before the one in
+     `.tmp/last_sent_episode.json` is new. **Episodes are matched by TITLE**
+     (case/quote/whitespace-insensitive; URL slug as fallback) -- not by URL
+     or date, which both changed in the Nov 2026 site move.
+   - If the last-sent episode isn't found in those pages, it stops with an
+     error rather than treating the whole archive as new.
+   - Fetches each new episode's page for its date (display only), audio URL
+     and show notes. Writes `.tmp/scraped_episode.json` (oldest first; empty
+     list = nothing new, exit 2).
 2. `python3 tools/transcribe_episode.py`
-   - Downloads the newest episode's audio, splits it into ~25-min chunks
+   - For each scraped episode (skipping any that already has a valid
+     summary): downloads the audio, splits it into ~25-min chunks
      (re-encoded to 64kbps mono so each chunk stays under Whisper's 25MB
      upload limit regardless of source bitrate), transcribes each chunk via
      OpenAI Whisper, and stitches the per-chunk timestamps into one
      episode-wide timeline.
-   - Writes `.tmp/transcript.json` (list of `{start, end, text}` segments).
+   - Writes `.tmp/transcripts/<slug>.json` (list of `{start, end, text}` segments).
 3. `python3 tools/summarize_episode.py`
+   - For each scraped episode (skipping any with a valid summary already):
    - Slices the transcript at each of MFM's own published show-notes
      timestamps. For both the per-chapter summaries and the Key Takeaways
      list, runs a **draft pass** with gpt-4o (grounded strictly in that
@@ -104,23 +120,25 @@ lives in an iCloud-synced ~/Documents.
      across multiple bullets. The judge pass explicitly re-checks for both
      duplicate-topic bullets and the exact count of 7; `summarize_episode.py`
      prints a warning to stderr if the final count isn't 7.
-   - Writes `episode_summaries/<jun_24_2026>.json` (filename = the episode's
-     published date, parsed from its show-notes date text, lowercased --
-     e.g. "June 24, 2026" -> `jun_24_2026.json`). This directory lives at the
-     project root, **not** in `.tmp` -- it's permanent, one file per episode,
-     never overwritten or cleared.
+   - Writes `episode_summaries/<slug>.json` (slug = last part of the
+     episode URL, e.g. `shes-making-40m-selling-a-game-to-rich-moms.json`).
+     Files before Nov 2026 are date-named (`nov_02_2026.json`) -- history
+     only. This directory lives at the project root, **not** in `.tmp` --
+     permanent, one file per episode.
 4. `python3 tools/build_email.py`
-   - Reads `.tmp/scraped_episode.json` + the newest episode's
-     `episode_summaries/<jun_24_2026>.json` + `EMAIL_HEADER_IMAGE_URL`.
-   - Writes `.tmp/email_body.html`.
-   - Exits 1 if there were no new episodes, or if the newest episode's
-     summary file is missing — **stop here, do not send**.
+   - For each scraped episode: reads its `episode_summaries/<slug>.json` +
+     `EMAIL_HEADER_IMAGE_URL`, writes `.tmp/emails/<slug>.html`. Records all
+     of them in `.tmp/last_built_episode.json`.
+   - Exits 1 (builds nothing) if any episode's summary is missing/invalid or
+     the header image doesn't load — **stop here, do not send**.
 5. `python3 tools/send_email.py`
-   - Sends `.tmp/email_body.html` to every address in
-     `tools/data/subscribers.csv`, one email per subscriber.
-   - Only updates `.tmp/last_sent_episode.json` if every send succeeds, so a
-     partial failure can be safely retried without double-sending to anyone
-     who already got it.
+   - Sends each episode's email, oldest first, as its own email (subject
+     `MFM Show Notes: <title>`) to every subscriber (`SUBSCRIBERS` env var
+     on GitHub, `tools/data/subscribers.csv` locally), one email per
+     subscriber. Skips episodes up to and including `last_sent_episode.json`.
+   - Advances `.tmp/last_sent_episode.json` after each episode reaches every
+     subscriber; on a failure it stops there, so a retry resumes with the
+     failed episode and never re-sends earlier ones.
 
 ## Email structure (top to bottom)
 1. Black header band: "MFM EPISODE HIGHLIGHTS" tagline in MFM yellow (font:
@@ -162,23 +180,29 @@ place.
 
 ## Guardrails (each step validates before the next, paid, step runs)
 All checks live in `tools/guards.py`; any failure exits 1 and stops the chain.
-- **scrape** (before Whisper): newest episode has an `audio_url`, show
-  notes, and at least one chapter timestamp.
+- **scrape** (before Whisper): EVERY new episode has an `audio_url`, show
+  notes, and at least one chapter timestamp; and the last-sent episode was
+  found on the listing (otherwise it refuses to guess what's new).
 - **transcribe** (before gpt-4o): every Whisper chunk returned segments and
   the transcript runs past the last chapter's start time.
 - **summarize**: refuses to run with no chapters. Output must have a
   non-empty summary for EVERY chapter plus non-empty key takeaways; a bad
-  result goes to `.tmp/rejected_summary.json`, never `episode_summaries/`.
+  result goes to `.tmp/rejected/<slug>.json`, never `episode_summaries/`.
   The batched call sometimes silently drops a chapter (seen Nov 2026 on a
   chapter 25s after the previous one, and one inside a long segment), so
   missing chapters are automatically re-requested on their own (a few
   cents). `summarize_episode.py --repair` re-uses the rejected file and
   only fills what's missing -- use it instead of a full paid re-run.
-- **build**: same summary check, plus the header image URL must return
-  HTTP 200 with an image content-type.
-- **send**: no send unless the episode's summary file has both non-empty
-  `chapter_summaries` and `key_takeaways`; no send if it's the episode in
-  `last_sent_episode.json` (pass `--resend` to override deliberately).
+- **transcribe/summarize skip**: an episode whose saved summary already
+  passes validation is skipped, so a repeat build (manual re-run, or a retry
+  after a failure) never pays for it twice.
+- **build**: same summary check for every episode, plus the header image URL
+  must return HTTP 200 with an image content-type.
+- **send** (per episode, before sending it): its email exists and
+  `last_built_episode.json` lists that exact episode (url + title); the
+  email contains the episode title; its summary has non-empty
+  `chapter_summaries` and `key_takeaways`. Episodes up to `last_sent` are
+  skipped (pass `--resend` to send the whole cycle again deliberately).
 
 ## Edge cases & handling
 - **Site format drift** (Nov 2026): dates changed from "June 24, 2026" to
@@ -191,14 +215,25 @@ All checks live in `tools/guards.py`; any failure exits 1 and stops the chain.
   image is now served from the public repo (`email_assets/image.png` via
   raw.githubusercontent.com); `upload_header_image.py`/Cloudinary are no
   longer used.
-- **Manual one-episode run**: `scrape_show_notes.py --date "Nov. 2, 2026"`
-  scrapes exactly that episode, bypassing new-episode detection.
+- **Site move to HubSpot** (Nov 2026): listing moved to
+  https://mfmpod.com/podcast (old /episodes/ redirects there), cards are
+  `.blog-podcast-show-episodes-item` with no date, episode URLs became
+  /podcast/<slug>, audio is an `<audio src>` tag, show notes are
+  `div.podcast-episode-show-notes p`, and the episode's own date is
+  `.podcast-episode-hero-date time[datetime]` (other dates on the page belong
+  to a "latest episodes" grid). Builds failed Nov 17-21 until the scraper
+  was updated; the scrape guard stopped them before any OpenAI spend.
+  Timestamps also appear as `0:00 - Topic` (no brackets) on some episodes.
+- **Manual one-episode run**: `scrape_show_notes.py --title "dying rich"`
+  scrapes exactly the one episode whose title contains that text (errors if
+  it matches 0 or several), bypassing new-episode detection.
 - **No new episode since last run**: `scrape_show_notes.py` writes an empty
   list; `build_email.py` exits 1; the scheduled agent should treat this as a
   normal no-op, not an error.
 - **Site structure changes / scrape parse failure**: `scrape_show_notes.py`
-  raises if `#show-notes .post-content-body` isn't found on an episode page —
-  investigate the site's HTML before re-running rather than retrying blindly.
+  raises if the listing has no episode cards or an episode page has no
+  show-notes container — investigate the site's HTML before re-running rather
+  than retrying blindly.
 - **mfmpod.com blocks default User-Agent**: confirmed 403 with no UA header;
   the scraper always sends a browser-like `User-Agent`. If blocking changes
   (e.g. Cloudflare challenge), this will need a real headless browser instead
@@ -233,10 +268,8 @@ All checks live in `tools/guards.py`; any failure exits 1 and stops the chain.
   `audio_url` found, or a transcript chunk comes back empty),
   `build_email.py` should not silently substitute a guessed summary — fix
   the upstream step instead.
-- **No published timestamps found**: if an episode's show notes have no
-  `(mm:ss)` timestamps, `summarize_episode.py` writes empty
-  `chapter_summaries`/`key_takeaways` rather than guessing chapter
-  boundaries itself.
+- **No published timestamps found**: the scrape guard stops the run (no
+  Whisper spend) -- chapter boundaries are never guessed.
 
 ## Tools reference
 - `tools/scrape_show_notes.py`

@@ -1,6 +1,7 @@
 # Job 1 of 2: scrape -> transcribe -> summarize -> build.
-# Mon-Fri 10:17 PM America/New_York. The prepared email is committed to
-# state/ so the send job (mfm-send.yml) can pick it up the next morning.
+# Mon-Fri 10:17 PM America/New_York. Handles every episode published since
+# the last send; one email per episode is committed to state/emails/ so the
+# send job (mfm-send.yml) can pick them up the next morning.
 name: MFM build
 
 on:
@@ -12,8 +13,8 @@ on:
     - cron: "17 3 * * 2-6"   # 10:17 PM EST (Mon-Fri ET)
   workflow_dispatch:
     inputs:
-      date:
-        description: 'Optional: build a specific episode, e.g. "Nov. 2, 2026" (blank = newest unsent)'
+      title:
+        description: 'Optional: build one specific episode by (part of) its title, e.g. "dying rich" (blank = all unsent)'
         required: false
         default: ""
 
@@ -27,7 +28,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120    # a backlog of several episodes takes ~5 min each
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       EMAIL_HEADER_IMAGE_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/email_assets/image.png
@@ -55,18 +56,20 @@ jobs:
           pip install -q -r requirements.txt
 
       - name: Restore state
+        # Build only needs to know what was last sent; everything else it
+        # produces fresh (so stale emails from older builds never linger).
         if: steps.gate.outputs.run == 'true'
-        run: mkdir -p .tmp && cp state/*.json state/*.html .tmp/ 2>/dev/null || true
+        run: mkdir -p .tmp && cp state/last_sent_episode.json .tmp/ 2>/dev/null || true
 
       - name: Scrape
         id: scrape
         if: steps.gate.outputs.run == 'true'
         env:
-          EPISODE_DATE: ${{ inputs.date }}
+          EPISODE_TITLE: ${{ inputs.title }}
         run: |
           set +e
-          if [ -n "$EPISODE_DATE" ]; then
-            python tools/scrape_show_notes.py --date "$EPISODE_DATE"
+          if [ -n "$EPISODE_TITLE" ]; then
+            python tools/scrape_show_notes.py --title "$EPISODE_TITLE"
           else
             python tools/scrape_show_notes.py
           fi
@@ -83,20 +86,23 @@ jobs:
         if: steps.scrape.outputs.new == 'true'
         run: python tools/summarize_episode.py
 
-      - name: Build email
+      - name: Build emails
         if: steps.scrape.outputs.new == 'true'
         run: python tools/build_email.py
 
       - name: Save state
-        # always(): even on failure, persist scraped_episode.json so the send
-        # job's stale-build guard sees the mismatch and refuses to send.
+        # always(): even on failure, replace the previous cycle's hand-off
+        # files, so the send job never sees an older build's emails as current
+        # (it refuses any episode without a matching fresh build).
         if: always() && steps.gate.outputs.run == 'true'
         run: |
-          for f in scraped_episode.json email_body.html last_built_episode.json; do
+          rm -rf state/emails state/email_body.html state/last_built_episode.json state/scraped_episode.json
+          for f in scraped_episode.json last_built_episode.json; do
             [ -f ".tmp/$f" ] && cp ".tmp/$f" state/
           done
+          [ -d .tmp/emails ] && cp -R .tmp/emails state/emails
           git config user.name "mfm-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state episode_summaries
+          git add -A state episode_summaries
           git diff --cached --quiet || git commit -m "build: $(date -u +%F) state update"
           git pull --rebase -q && git push -q

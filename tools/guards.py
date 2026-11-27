@@ -14,7 +14,6 @@ Each check returns a list of human-readable problems; empty list = OK.
 """
 import os
 import re
-from datetime import datetime
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUMMARIES_DIR = os.path.join(ROOT_DIR, "episode_summaries")
@@ -33,16 +32,58 @@ def timestamp_to_seconds(ts):
     return seconds
 
 
-def parse_episode_date(date_text):
-    """The site has used both "June 24, 2026" and "Nov. 2, 2026" / "Sept. 30, 2026"."""
-    month, rest = date_text.strip().split(" ", 1)
-    return datetime.strptime(f"{month.rstrip('.')[:3]} {rest.strip()}", "%b %d, %Y")
+
+TMP_DIR = os.path.join(ROOT_DIR, ".tmp")
+
+# --- Episode identity -------------------------------------------------------
+# Episodes are identified by TITLE (normalized), not URL or date: the site
+# moved to HubSpot in Nov 2026 and every URL changed (www.mfmpod.com/<slug>/
+# -> mfmpod.com/podcast/<slug>), and the listing page no longer shows dates.
+# The URL slug is kept only as a fallback match in case a title is edited.
+
+_QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-"})
+
+
+def norm_title(title):
+    """Case/quote/whitespace-insensitive title key."""
+    return re.sub(r"\s+", " ", (title or "").translate(_QUOTES)).strip().lower()
+
+
+def slug_of(url):
+    """Last path segment: .../podcast/<slug> and the old .../<slug>/ both work."""
+    return (url or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def same_episode(a, b):
+    """True if two episode dicts ({title, url}) refer to the same episode."""
+    if not a or not b:
+        return False
+    if a.get("title") and norm_title(a.get("title")) == norm_title(b.get("title")):
+        return True
+    return bool(a.get("url")) and slug_of(a.get("url")) == slug_of(b.get("url"))
+
+
+def episode_key(episode):
+    """Filesystem-safe per-episode key (the URL slug)."""
+    return re.sub(r"[^a-z0-9-]+", "-", slug_of(episode["url"]).lower()).strip("-")
 
 
 def summary_path_for(episode):
-    """episode_summaries/<nov_02_2026>.json for an episode dict."""
-    name = parse_episode_date(episode["date_text"]).strftime("%b_%d_%Y").lower() + ".json"
-    return os.path.join(SUMMARIES_DIR, name)
+    """episode_summaries/<slug>.json (permanent; one file per episode).
+    Files before Nov 2026 are date-named (nov_02_2026.json) -- history only."""
+    return os.path.join(SUMMARIES_DIR, episode_key(episode) + ".json")
+
+
+def transcript_path_for(episode):
+    return os.path.join(TMP_DIR, "transcripts", episode_key(episode) + ".json")
+
+
+def email_path_for(episode):
+    return os.path.join(TMP_DIR, "emails", episode_key(episode) + ".html")
+
+
+def rejected_path_for(episode):
+    return os.path.join(TMP_DIR, "rejected", episode_key(episode) + ".json")
 
 
 def chapter_timestamps(show_notes):
